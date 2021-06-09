@@ -3,9 +3,15 @@ Samba/CIFS Mount helper
 
 This is a helper tool for managing SMB shares that uses config files (default /opt/conf/simplemount/conf) and not commandline arguments.
 
-BASEDIR - /opt/simplemount/ 	 	- where the script/conf sit and thats about it
-DEFAULTCONF - /opt/simplemount/conf	- where to put standard shares that most servers will need
-		  /opt/simplemount/secrets/	- put your credential files here, make sure the keys are only readable by root though.
+**BASEDIR**
+
+/opt/simplemount/ 	 	- where the script/conf sit and thats about it
+
+**DEFAULTCONF**
+
+/opt/simplemount/conf	- where to put standard shares that most servers will need
+
+/opt/simplemount/secrets/	- put your credential files here, make sure the keys are only readable by root though.
       
 
 # Config File
