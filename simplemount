@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+#
+# simplemount - SMB mounts using config files
+#
+readonly DEFAULTDIR="/opt/simplemount/conf"
+readonly REQUIRED_VARS=( "server" "sharename" "mount_point" )
+declare -a configlist; configlist=()
+declare -a configdirlist; configdirlist=()
+
+set -euf -o pipefail
+
+err() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*" >&2
+}
+
+# https://stackoverflow.com/questions/1298066/how-to-check-if-package-installed-and-install-it-if-not
+readonly pkg="cifs-utils"
+status="$(dpkg-query -W --showformat='${db:Status-Status}' "$pkg" 2>&1)"
+if [ ! $? = 0 ] || [ ! "$status" = installed ]; then
+  err "Missing Package: $pkg";
+  exit 1;
+fi
+
+get_conf_in_dir () {
+    find "$1" -maxdepth 1 -name "*.conf"
+}
+#######################################
+# Remove SMB mount from /etc/fstab
+# Arguments:
+#   Config string from read_conf_file ()
+# Returns:
+#   0 if removed, non-zero if unable
+#######################################
+function remove_fstab () {
+    # https://wiki.ubuntu.com/MountWindowsSharesPermanently
+    read -r server sharename mount_point <<< "$(parse_required "${@}")"
+    local options; options="$(parse_options "${@}")"
+    local type="cifs"
+
+    if ! grep -q "^//${server}/${sharename} ${mount_point}" /etc/fstab ; then
+        err "//${server}/${sharename} ${mount_point} not in fstab."; return 1;
+    fi;
+
+    if ! [[ -w /etc/fstab ]] ;then
+        err "Can't write to /etc/fstab, are you root?"; return 1;
+    fi;
+
+    local line; line="$(printf "//%s %s"  "${server}/${sharename}" "${mount_point}")"
+    if [[ "${dryrun-}" == true ]]; then
+        printf "Removing from /etc/fstab (DRY): %s\n" "${line}"
+        return 0
+    fi;
+    
+    printf "Removing from /etc/fstab: %s\n" "${line}"
+    sed -i '\:'"$line"':d' /etc/fstab
+}
+#######################################
+# Create SMB mount record in /etc/fstab
+# Arguments:
+#   Config string from read_conf_file ()
+# Returns:
+#   0 if added, non-zero if unable
+#######################################
+create_fstab () {
+    # https://wiki.ubuntu.com/MountWindowsSharesPermanently
+    read -r server sharename mount_point <<< "$(parse_required "${@}")"
+    local options
+    options="$(parse_options "${@}")"
+
+    local type="cifs"
+
+    if grep -q "^//${server}/${sharename}" /etc/fstab ; then
+        err "//${server}/${sharename} already enabled."; return 1;
+    fi;
+    if ! [[ -w /etc/fstab ]] ;then
+        err "Can't write to /etc/fstab, are you root?"; return 1;
+    fi;
+
+    local line; line="$(printf "%s %s %s %s %s %s\n"  "//${server}/${sharename}" "${mount_point}" "${type}" "${options- }" "0" "0")"
+
+    if [[ "${dryrun-}" == true ]]; then
+        printf "Adding to /etc/fstab (DRY): %s\n" "${line}"
+        return 0
+    fi;
+
+    printf "Adding to /etc/fstab: %s\n" "${line}"
+    echo "${line}" >> /etc/fstab
+    return 0
+}
+#######################################
+# Try to mount SMB share to mountpoint
+# Arguments:
+#   Config string from read_conf_file ()
+# Returns:
+#   0 if mounted, non-zero if unable
+#######################################
+mount_share () {
+    read -r server sharename mount_point <<< "$(parse_required "${@}")"
+    local options
+    options="$(parse_options "${@}")"
+    
+    # TODO test if device or directory
+
+    # If not a block device and directory doesn't exist, create directory
+    [[ ! -b "${mount_point}" ]] && [[ ! -d "${mount_point}" ]] && mkdir "${mount_point}" 
+
+    # Check if device or directory is mounted.
+    if isMounted "${mount_point}"; 
+        then err "${mount_point} is already mounted."; return 1;
+    fi
+    
+    if [ -n "$(ls -A "${mount_point}" 2>/dev/null)" ];then
+        err "Directory not empty. Are you sure? Use --force to mount anyways"
+        if ! [[ "${force-}" == true ]]; then return 1; fi;
+    fi;
+
+    if [[ "${dryrun-}" == true ]]; then
+        printf "Mounting (DRY): //%s/%s to %s\n" "${server}" "${sharename}" "${mount_point}"
+        return 0
+    fi;
+
+    printf "Mounting: //%s/%s to %s\n" "${server}" "${sharename}" "${mount_point}"
+    if [[ -z ${options+x} ]]; then
+        mount -t cifs "//${server}/${sharename}" "${mount_point}"
+    else
+        mount -t cifs "//${server}/${sharename}" "${mount_point}" -o "${options}"
+    fi
+}
+#######################################
+# Try to unmount SMB share from mount point
+# Arguments:
+#   Config string from read_conf_file ()
+# Returns:
+#   0 if mounted, non-zero if unable
+#######################################
+unmount_share () {
+    read -r server sharename mount_point <<< "$(parse_required "${@}")"
+    
+    if ! isMounted "${mount_point}"; then
+        err "${mount_point} is not mounted."; return 2;
+    fi;
+    
+    if ! [[ -w "${mount_point}" ]] ;then
+        err "Can't modify ${mount_point}, are you root?"; return 1;
+    fi;
+    
+    if fuser -sm "${mount_point}"; then
+        err "Mount: ${mount_point} is busy."
+        fuser -vm "${mount_point}" >&2
+        return 1
+    fi;
+    
+    if [[ "${dryrun-}" == true ]]; then
+        printf "Unmounting (DRY): //%s/%s from %s\n" "${server}" "${sharename}" "${mount_point}"
+        return 0
+    fi;
+
+    printf "Unmounting: //%s/%s from %s\n" "${server}" "${sharename}" "${mount_point}"
+    umount "${mount_point}"
+}
+# return codes: 0 = found, 1 = not found
+# https://serverfault.com/questions/50585/whats-the-best-way-to-check-if-a-volume-is-mounted-in-a-bash-script
+isMounted    () { findmnt -rno SOURCE,TARGET "$1" >/dev/null;} #path or device
+
+#######################################
+# Parse the REQUIRED variables from an SMB Config
+# Arguments:
+#   Multi-line config string from read_conf_file ()
+# Globals:
+#   REQUIRED_VARS -> (SERVER, SHARENAME, MOUNT_POINT)
+# Outputs:
+#   List of parsed required values in format "1 2 3"
+#######################################
+parse_required () {
+    local conf="${*}"
+    local r=""; local v="";
+    for req in "${REQUIRED_VARS[@]}"; do
+        v=$(echo "${conf}" | grep "${req}" | cut -d"=" -f2)
+        r+="${v} "
+        if [[ -z ${v+x} ]]; then err "Config File: ${filename} - Missing required variable ${req}"; return 1; fi;
+    done;
+    echo "${r}"
+}
+#######################################
+# Parse the OPTIONAL variables from an SMB Config
+# See options section of 'man mount.cifs'
+# Arguments:
+#   Multi-line config string from read_conf_file ()
+# Globals:
+#   REQUIRED_VARS -> (SERVER, SHARENAME, MOUNT_POINT)
+# Outputs:
+#   List of parsed options in -o format "a=1,b=2,c=3,foo,bar"
+#######################################
+parse_options () {
+    local conf="${*}"
+    local r=''
+    for r in "${REQUIRED_VARS[@]}" ; do
+        conf="$(echo "${conf:-}" | grep -E -v "^${r}=")"
+    done;
+    conf=$(echo "${conf:-}" | tr '\n' ',') # reformat remainder of config for 'mount -o'
+    conf=${conf%,} # remove trailing ,
+    conf=${conf#,} # remove leading ,
+    echo "${conf-}" && return 0
+}
+#######################################
+# Returns formatted row for table printed by ls COMMAND
+# Arguments:
+#   Multi-line config string from read_conf_file ()
+# Outputs:
+#  TAB delimitted row of formatted SMB config values
+#######################################
+list_mount () {
+    local filename="$1"; shift;
+    local options
+    options="$(parse_options "${@}")" 
+    read -r server sharename mount_point <<< "$(parse_required "${@}")"
+    if isMounted "${mount_point}"; then mounted="YES"; else mounted="NO"; fi
+    if grep -q "^//${server}/${sharename}" /etc/fstab ; then enabled="YES"; else enabled="NO"; fi
+   
+    printf "\n%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "${filename}" "${server}" "${sharename}" "${mount_point}" "${mounted}" "${enabled}" "${options}"
+}
+#######################################
+# Read lines from config file, ignoring comments
+# See options section of 'man mount.cifs'
+# Arguments:
+#   filename - SMB config file for reading
+# Outputs:
+#  Multi-line string of SMB variables
+#   var=value
+#   var2=123
+#   keyword
+#######################################
+read_conf_file () {
+    local filename="$1"
+    local config
+    if ! [[ -r "${filename}" ]]; then err "Could not read ${filename}"; exit 2; fi;
+    
+    if [[ "$EUID" -ne 0 ]] && ! [[ "$(stat "${filename}" -c '%A' | cut -c9)" =~ "-" ]]; then
+        err "Bad Permissions: ${filename} cannot be writable by everyone when running as root."
+        return 1;
+    fi;
+    config="$(sed -e '/^\s*#.*$/d' -e '/^\s*$/d' "${filename}")"
+    echo "${config}"
+}
+
+usage () {
+  cat <<EOF >&2
+Usage: $0 [OPTIONS] COMMAND
+
+Commands:
+  ls          Displays shares in table
+  mount       Mount an SMB share, requires conf
+  unmount     Unmount an SMB share, requires conf
+  enable      Enables automatic mounting on startup via /etc/fstab
+  disable     Disables automatic mounting on startup via /etc/fstab
+
+Options:
+-c, --config        Config files that define a mount
+-d, --directory     Directory to look for configs
+-f, --force         Mount despite warnings
+-v, --verbose       Debug Info (set -x)
+-d, --dry           Run pre-checks but do not mount/unmount
+-a                  Mount all in the default conf location
+EOF
+}
+
+# https://medium.com/@Drew_Stokes/bash-argument-parsing-54f3b81a6a8f
+PARAMS=""; while (( "$#" )); do
+  case "$1" in
+    -v | --verbose)
+        set -x
+        shift
+        ;;
+    --dry)
+        dryrun=true
+        shift
+        ;;
+    --force)
+        force=true
+        shift
+        ;;
+    -c | --config)
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+            configlist+=("${2}")
+            shift 2
+        else
+            err "Error: Argument for $1 is missing"2
+            exit 1
+        fi        
+        ;;
+    -d | --directory)
+        # TODO - Remove -d and allow -c to specify directories
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+            configdirlist+=("${2}")
+            shift 2
+        else
+            err "Error: Argument for $1 is missing"2
+            exit 1
+        fi        
+        ;;
+    -a)
+        all=true
+        shift
+        ;;
+    -*|--*=) # unsupported flags
+      echo "Error: Unsupported flag $1" >&2
+      exit 1
+      ;;
+    *) # preserve positional arguments
+      PARAMS="$PARAMS $1"
+      shift
+      ;;
+  esac
+done; #  set positional arguments in their proper place
+eval set -- "$PARAMS"
+
+if [[ "$#" -ne 1 ]]; then usage; exit 1; fi;
+case "$1" in
+    ls)
+    list=true;
+    ;;
+    mount)
+    mount=true;
+    ;;
+    unmount)
+    unmount=true;
+    ;;
+    enable)
+    persist=true;
+    ;;
+    disable)
+    remove=true;
+    ;;
+    *)
+    usage; exit 1;
+    ;;
+esac;
+ 
+ # These commands require a config, or -a to be specified
+case "$1" in mount|unmount|enable|disable)
+        if (( ${#configdirlist[@]} == 0 )) && (( ${#configlist[@]} == 0 )); then
+            if [[ "${all-}" == true ]]; then
+                    configdirlist+=("${DEFAULTDIR}")
+            else
+                err "$1 - Specify a --config|--directory or use -a to mount defaults"
+            fi;
+        fi;
+    ;;
+    *)
+    ;;
+esac;
+
+# ls - Use default directory if none specified
+if [[ "${list-}" == true ]] && (( ${#configdirlist[@]} == 0 )) && (( ${#configlist[@]} == 0 )); then
+    configdirlist+=("${DEFAULTDIR}")
+fi;
+
+# Get files from dir list and add to config file list
+for d in "${configdirlist[@]}" ; do
+    for f in $(get_conf_in_dir "${d}"); do
+        if [[ ! "${configlist[*]}" =~ ${f} ]]; then
+            # Add to config list
+            configlist+=("${f}")
+        fi
+    done
+done
+
+if [[ "${list-}" == true ]]; then # Add header for ls output
+    output="$(echo -e "FILENAME ${REQUIRED_VARS[*]^^} MOUNTED ENABLED OPTIONS\n" | tr ' ' '\t')"
+fi;
+
+for c in "${configlist[@]}"; do
+    
+    # Read config using filename
+    conf="$(read_conf_file "${c}")"
+
+    # COMMAND
+    # || true - allow failure with set -e (if we fail to mount share1, we still want to mount share2)
+    if [[ "${list-}" == true ]]; then
+        output+="$(list_mount "$c" "${conf}")"
+    elif [[ "${remove-}" == true ]]; then
+        remove_fstab "${conf}" || true
+    elif [[ "${persist-}" == true ]]; then 
+        create_fstab "${conf}" || true
+    elif [[ "${mount-}" == true ]]; then 
+        mount_share "${conf}" || true
+    elif [[ "${unmount-}" == true ]]; then 
+        unmount_share "${conf}" || true
+    fi;
+
+done
+
+# Print ls output
+if [[ "${list-}" == true ]]; then
+    echo "$output" | column -t
+fi; 
